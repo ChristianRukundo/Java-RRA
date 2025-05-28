@@ -108,8 +108,7 @@ public class OtpService {
      */
     @Transactional
     public void cleanupOldOtps() {
-        // Define a cleanup threshold, e.g., OTPs older than 1 day (even if not used but expired)
-        // or used OTPs older than a few hours.
+
         LocalDateTime cleanupThreshold = LocalDateTime.now().minusDays(1); // Example: clean OTPs expired more than a day ago
         log.info("Performing cleanup of old OTPs expired or used before: {}", cleanupThreshold);
         int deletedCount = otpRepository.deleteExpiredAndUsedOtps(cleanupThreshold);

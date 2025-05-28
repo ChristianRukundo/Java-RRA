@@ -50,69 +50,86 @@ public class OwnerShipService {
      */
     @Transactional
     public void transferVehicleOwnership(VehicleTransferRequestDto dto) {
-        log.info("Initiating vehicle transfer for vehicle ID: {} from owner ID: {} to owner ID: {}",
-                dto.getVehicleId(), dto.getCurrentOwnerId(), dto.getNewOwnerId());
+        log.info("Admin initiating vehicle transfer for vehicle ID: {} to new owner ID: {}",
+                dto.getVehicleId(), dto.getNewOwnerId()); // Removed currentOwnerId from initial log as it needs verification
 
+        // 1. Validate Entities
         Vehicle vehicle = vehicleRepository.findById(dto.getVehicleId())
                 .filter(v -> !v.isDeleted())
                 .orElseThrow(() -> new ResourceNotFoundException("Vehicle", "ID", dto.getVehicleId()));
 
-        Owner currentOwner = ownerRepository.findById(dto.getCurrentOwnerId())
-                .filter(o -> !o.isDeleted())
-                .orElseThrow(() -> new ResourceNotFoundException("Current Owner", "ID", dto.getCurrentOwnerId()));
+        // Determine the ACTUAL current owner from ownership records
+        OwnerShip currentActualOwnerShipRecord = ownerShipRepository.findFirstByVehicleAndEndDateIsNullOrderByStartDateDesc(vehicle)
+                .orElseThrow(() -> new ValidationException("Vehicle ID " + vehicle.getId() + " has no current active ownership record. Cannot transfer."));
+        Owner actualCurrentOwner = currentActualOwnerShipRecord.getOwner();
+
+        // Verify the currentOwnerId from DTO matches the actual current owner (important check)
+        if (!actualCurrentOwner.getId().equals(dto.getCurrentOwnerId())) {
+            throw new ValidationException(String.format(
+                    "The provided currentOwnerId (%s) does not match the vehicle's actual current owner (ID: %s). Transfer request invalid.",
+                    dto.getCurrentOwnerId(), actualCurrentOwner.getId()
+            ));
+        }
+        // Now, 'actualCurrentOwner' is the verified current owner.
 
         Owner newOwner = ownerRepository.findById(dto.getNewOwnerId())
                 .filter(o -> !o.isDeleted())
                 .orElseThrow(() -> new ResourceNotFoundException("New Owner", "ID", dto.getNewOwnerId()));
 
-        if (currentOwner.getId().equals(newOwner.getId())) {
+        if (actualCurrentOwner.getId().equals(newOwner.getId())) {
             throw new ValidationException("Cannot transfer vehicle to the same owner.");
         }
 
-        OwnerShip currentOwnerShipRecord = ownerShipRepository.findFirstByVehicleAndOwnerAndEndDateIsNullOrderByStartDateDesc(vehicle, currentOwner)
-                .orElseThrow(() -> new ValidationException(
-                        String.format("Owner ID %s does not currently own vehicle ID %s or ownership record is inconsistent.",
-                                currentOwner.getId(), vehicle.getId())));
-
         // --- Plate Number Logic ---
-        PlateNumber existingPlate = vehicle.getPlateNumbers().stream()
-                .filter(pn -> pn.getStatus() == PlateStatus.IN_USE && pn.getOwner().getId().equals(currentOwner.getId()))
-                .findFirst()
-                .orElseThrow(() -> new ValidationException("No active IN_USE plate found for the vehicle under the current owner."));
+        // Find the plate IN_USE on THIS vehicle. Its owner *must* be actualCurrentOwner.
+        PlateNumber existingPlateOnVehicle = vehicle.getPlateNumbers().stream()
+                .filter(pn -> pn.getStatus() == PlateStatus.IN_USE)
+                .findFirst() // A vehicle should only have one IN_USE plate.
+                .orElseThrow(() -> new ValidationException("No active IN_USE plate found for vehicle ID " + vehicle.getId() + ". Data inconsistency."));
 
-        log.info("Marking existing plate {} as TRANSFERRED_OUT for vehicle ID {}.", existingPlate.getPlateNumber(), vehicle.getId());
-        existingPlate.setStatus(PlateStatus.TRANSFERRED_OUT); // Or AVAILABLE based on policy
-        // Detach from current vehicle and owner if the plate truly becomes "available" in a general pool
-        // For now, status change is key. Reassignment happens when a new vehicle gets this plate.
-        plateNumberRepository.save(existingPlate);
+        // Double check if the owner of this IN_USE plate is indeed the actualCurrentOwner
+        if (!existingPlateOnVehicle.getOwner().getId().equals(actualCurrentOwner.getId())) {
+            throw new ValidationException(String.format(
+                    "Data inconsistency: Active plate %s on vehicle %s is owned by %s, but current vehicle owner is %s.",
+                    existingPlateOnVehicle.getPlateNumber(), vehicle.getId(), existingPlateOnVehicle.getOwner().getId(), actualCurrentOwner.getId()
+            ));
+        }
 
-        // Handle the new plate for the new owner
-        Optional<PlateNumber> newPlateOpt = plateNumberRepository.findByPlateNumber(dto.getNewPlateNumberStringForNewOwner());
-        if (newPlateOpt.isPresent()) {
-            PlateNumber potentialNewPlate = newPlateOpt.get();
-            if (potentialNewPlate.getStatus() == PlateStatus.IN_USE) {
-                // Allow reassigning if it's to the *same vehicle* (e.g., correcting an error)
-                // but not if it's IN_USE on a *different* vehicle.
-                if (potentialNewPlate.getVehicle() != null && !potentialNewPlate.getVehicle().getId().equals(vehicle.getId())) {
-                    throw new ValidationException("The provided new plate number '" + dto.getNewPlateNumberStringForNewOwner() + "' is already in use on a different vehicle.");
-                }
+        log.info("Marking existing plate {} (ID: {}) as TRANSFERRED_OUT for vehicle ID {}.",
+                existingPlateOnVehicle.getPlateNumber(), existingPlateOnVehicle.getId(), vehicle.getId());
+        existingPlateOnVehicle.setStatus(PlateStatus.TRANSFERRED_OUT);
+        plateNumberRepository.save(existingPlateOnVehicle);
+
+        // Handle the new plate for the new owner (using dto.getNewPlateNumberStringForNewOwner)
+        // This logic remains largely the same as before, ensuring the new plate is valid for the newOwner.
+        Optional<PlateNumber> potentialNewPlateOpt = plateNumberRepository.findByPlateNumber(dto.getNewPlateNumberStringForNewOwner());
+        PlateNumber plateToAssignToVehicle;
+
+        if (potentialNewPlateOpt.isPresent()) {
+            PlateNumber foundPlate = potentialNewPlateOpt.get();
+            // Validations: Must belong to newOwner, must be AVAILABLE/TRANSFERRED_OUT, or if IN_USE then on NO vehicle or THIS vehicle
+            if (!foundPlate.getOwner().getId().equals(newOwner.getId())) {
+                throw new ValidationException(String.format("Plate number '%s' for new owner exists but is registered to a different owner (Owner ID %s).",
+                        dto.getNewPlateNumberStringForNewOwner(), foundPlate.getOwner().getId()));
             }
-            // If the plate exists, is AVAILABLE, and belongs to the new owner, re-use it.
-            // Or if it's TRANSFERRED_OUT and belongs to the new owner (meaning they previously had it on another car)
-            if ((potentialNewPlate.getStatus() == PlateStatus.AVAILABLE || potentialNewPlate.getStatus() == PlateStatus.TRANSFERRED_OUT)
-                    && potentialNewPlate.getOwner().getId().equals(newOwner.getId())) {
+            if (foundPlate.getStatus() == PlateStatus.IN_USE) {
+                if (foundPlate.getVehicle() != null && !foundPlate.getVehicle().getId().equals(vehicle.getId())) { // If IN_USE on another vehicle
+                    throw new ValidationException(String.format("Plate number '%s' is already IN_USE on a different vehicle (ID: %s).",
+                            dto.getNewPlateNumberStringForNewOwner(), foundPlate.getVehicle().getId()));
+                }
+                // If IN_USE on this vehicle AND owner is newOwner, this is a strange state but means plate is already set.
+                plateToAssignToVehicle = foundPlate; // Already correct
+            } else if (foundPlate.getStatus() == PlateStatus.AVAILABLE || foundPlate.getStatus() == PlateStatus.TRANSFERRED_OUT) {
                 log.info("Re-assigning existing {} plate {} to vehicle {} for new owner {}.",
-                        potentialNewPlate.getStatus(), potentialNewPlate.getPlateNumber(), vehicle.getId(), newOwner.getId());
-                potentialNewPlate.setVehicle(vehicle); // Assign to this vehicle
-                potentialNewPlate.setStatus(PlateStatus.IN_USE);
-                plateNumberRepository.save(potentialNewPlate);
+                        foundPlate.getStatus(), foundPlate.getPlateNumber(), vehicle.getId(), newOwner.getId());
+                foundPlate.setVehicle(vehicle);
+                foundPlate.setStatus(PlateStatus.IN_USE);
+                plateToAssignToVehicle = plateNumberRepository.save(foundPlate);
             } else {
-                throw new ValidationException(
-                        String.format("Plate number '%s' exists but is not in an assignable status (AVAILABLE/TRANSFERRED_OUT) or not associated with the new owner ID %s.",
-                                dto.getNewPlateNumberStringForNewOwner(), newOwner.getId()));
+                throw new ValidationException(String.format("Plate number '%s' (owned by new owner) is not in an assignable status (current: %s).",
+                        dto.getNewPlateNumberStringForNewOwner(), foundPlate.getStatus()));
             }
         } else {
-            // Plate does not exist, issue it as a brand new plate for the new owner and this vehicle
             log.info("Issuing new plate {} for new owner {} and vehicle {}.",
                     dto.getNewPlateNumberStringForNewOwner(), newOwner.getId(), vehicle.getId());
             PlateNumber brandNewPlate = new PlateNumber();
@@ -120,14 +137,14 @@ public class OwnerShipService {
             brandNewPlate.setOwner(newOwner);
             brandNewPlate.setVehicle(vehicle);
             brandNewPlate.setStatus(PlateStatus.IN_USE);
-            plateNumberRepository.save(brandNewPlate);
+            plateToAssignToVehicle = plateNumberRepository.save(brandNewPlate);
         }
 
         // --- Update Ownership Records ---
         log.info("Ending current ownership (ID: {}) for vehicle ID {} by owner ID {}",
-                currentOwnerShipRecord.getId(), vehicle.getId(), currentOwner.getId());
-        currentOwnerShipRecord.setEndDate(Instant.now());
-        ownerShipRepository.save(currentOwnerShipRecord);
+                currentActualOwnerShipRecord.getId(), vehicle.getId(), actualCurrentOwner.getId());
+        currentActualOwnerShipRecord.setEndDate(Instant.now());
+        ownerShipRepository.save(currentActualOwnerShipRecord);
 
         OwnerShip newOwnerShipRecord = new OwnerShip();
         newOwnerShipRecord.setVehicle(vehicle);
@@ -138,8 +155,10 @@ public class OwnerShipService {
         ownerShipRepository.save(newOwnerShipRecord);
         log.info("Created new ownership record for vehicle ID {} by new owner ID {}", vehicle.getId(), newOwner.getId());
 
-        // --- Send Notifications ---
-        sendTransferNotifications(currentOwner, newOwner, vehicle, existingPlate.getPlateNumber(), dto.getNewPlateNumberStringForNewOwner(), dto.getTransferAmount());
+        sendTransferNotifications(actualCurrentOwner, newOwner, vehicle,
+                existingPlateOnVehicle.getPlateNumber(),
+                plateToAssignToVehicle.getPlateNumber(),
+                dto.getTransferAmount());
 
         log.info("Vehicle transfer completed successfully for vehicle ID: {}", vehicle.getId());
     }
