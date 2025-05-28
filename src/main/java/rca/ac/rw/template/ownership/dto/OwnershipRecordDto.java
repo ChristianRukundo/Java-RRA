@@ -20,5 +20,5 @@ public class OwnershipRecordDto {
     private Instant startDate;
     private Instant endDate; // Null for current owner
     private BigDecimal transferAmount;
-    // private String plateNumberActiveDuringOwnership; // Could be added later
+
 }

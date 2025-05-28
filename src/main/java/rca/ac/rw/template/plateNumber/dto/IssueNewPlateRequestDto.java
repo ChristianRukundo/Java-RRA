@@ -24,6 +24,4 @@ public class IssueNewPlateRequestDto {
     @ValidPlateNumber
     private String plateNumberString;
 
-    // Old plate number (optional, if this is a replacement)
-    private String oldPlateNumberString; // To mark the old one as 'RETIRED' or 'AVAILABLE'
 }

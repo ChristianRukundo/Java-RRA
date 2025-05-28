@@ -76,8 +76,8 @@ public class VehicleService {
         plateNumber.setOwner(owner);
         plateNumber.setVehicle(savedVehicle);
         plateNumber.setStatus(PlateStatus.IN_USE); // Set initial status
-        // issuedDate is handled by @CreationTimestamp on PlateNumber entity's 'createdAt' or a specific 'issuedDate' field
-        // If 'issuedDate' is separate from 'createdAt' on PlateNumber, set it here: plateNumber.setIssuedDate(Instant.now());
+         // issuedDate is handled by @CreationTimestamp on PlateNumber entity's 'createdAt' or a specific 'issuedDate' field
+        //        // If 'issuedDate' is separate from 'createdAt' on PlateNumber, setit here: plateNumber.setIssuedDate(Instant.now());
         PlateNumber savedPlateNumber = plateNumberRepository.save(plateNumber);
         log.info("Plate number {} issued with ID: {} for vehicle {}", savedPlateNumber.getPlateNumber(), savedPlateNumber.getId(), savedVehicle.getId());
 
